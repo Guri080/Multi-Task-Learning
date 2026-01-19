@@ -2,10 +2,16 @@ import torchvision.models as models
 import torchvision
 import torch.nn as nn
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Dataset
 from torchvision import datasets, transforms
+from torch.optim import Adam
 
 from tqdm import tqdm
+
+import pandas as pd
+import numpy as np 
+from PIL import Image
+import os
 
 import config
 
@@ -37,9 +43,9 @@ class ResNet_MTL(nn.Module):
         return out
 
 # getter for the train/val loaders for the cats and dogs dataset
-def CatsVsDogs_Dataset(tranformations):
+def catsVsDogs_Dataset(tranformations):
     
-    data_dir = "/scratch/gssodhi/catNdogs/PetImages"  # path to folder containing cats/ and dogs/
+    data_dir = "/scratch/gssodhi/catNdogs/PetImages"  # path to folder containing cats and dogs
 
     train_transform = tranformations['train']
     val_transform = tranformations['val']
@@ -55,13 +61,13 @@ def CatsVsDogs_Dataset(tranformations):
     train_size = int(0.7 * len(full_dataset))
     val_size = len(full_dataset) - train_size
 
-    train_dataset, val_dataset, test_dataset = random_split(
+    train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size]
     )
 
     train_dataset.dataset.transform = train_transform
-    val_dataset.dataset.transform = val_test_transform
+    val_dataset.dataset.transform = val_transform
 
 
     train_loader = DataLoader(
@@ -80,63 +86,71 @@ def CatsVsDogs_Dataset(tranformations):
 
     return train_loader, val_loader
 
-def train(model, loader1, loader2, criterion1, criterion2, optimizer, device):
+
+class ButterFly(Dataset):
+    def __init__(self, csv_path, root_dir, split, transform=None):
+        self.df = pd.read_csv(csv_path)
+
+        self.df = self.df[self.df['data set'] == split].reset_index(drop=True)
+
+        self.root_dir = root_dir
+        self.transformation = transform
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        img_path = os.path.join(self.root_dir, row['filepaths'])
+        image = Image.open(img_path).convert("RGB")
+
+        label = int(row['class id'])
+
+        if self.transformation:
+            image = self.transformation(image)
+
+        return image, label
+
+
+
+def train(model, loader, criterion, optimizer, device, task):
     model.train()
-    running_loss_1 = 0.0
-    running_loss_2 = 0.0
+    running_loss = 0.0
 
+    for x, y in tqdm(loader, desc='train'):
+        x, y = x.to(device), y.to(device)
 
-    for (x1, y1), (x2, y2) in tqdm(zip(loader1, loader2), desc='train'):
-        x1, y1, x2, y2 = x1.to(device), y1.to(device), x2.to(device), y2.to(device)
+        if task == 'bce':
+            y = y.float().unsqueeze(1)
 
         optimizer.zero_grad()
-
-        # forward prop for dataset 1
-        out_1 = model(x1, 'bce')
-        loss_1 = criterion1(out_1, y1)
-        # forward prop for dataset 2
-        out_2 = model(x2, 'ce')
-        loss_2 = criterion2(out_2, y2)
-
-        total_loss = loss_1 + loss_2
-
-        # backprop and take a step
-        avg_loss.backward()
+        out = model(x, task)
+        loss = criterion(out, y)
+        loss.backward()
         optimizer.step()
 
-        running_loss_1 += loss_1.item()
-        running_loss_2 += loss_2.item()
-    
-    avg_loss_1 = running_loss_1 / len(loader1)
-    avg_loss_2 = running_loss_2 / len(loader2)
+        running_loss += loss.item()
 
-    return avg_loss_1, avg_loss_2
+    return running_loss / len(loader)
 
-def test(model, loader1, loader2, criterion1, criterion2, device):
+def test(model, loader, criterion, device, task):
     model.eval()
-    running_loss_1 = 0.0
-    running_loss_2 = 0.0
+    running_loss = 0.0
 
     with torch.no_grad():
-        for (x1, y1), (x2, y2) in tqdm(zip(loader1, loader2), desc='val'):
-                x1, y1, x2, y2 = x1.to(device), y1.to(device), x2.to(device), y2.to(device)
+        for x, y in tqdm(loader, desc='val'):
+            x, y = x.to(device), y.to(device)
 
-                # forward prop for dataset 1
-                out_1 = model(x1, 'bce')
-                loss_1 = criterion1(out_1, y1)
-                # forward prop for dataset 2
-                out_2 = model(x2, 'ce')
-                loss_2 = criterion2(out_2, y2)
+            if task == 'bce':
+                y = y.float().unsqueeze(1)
 
-                total_loss = loss_1 + loss_2
+            out = model(x, task)
+            loss = criterion(out, y)
+            running_loss += loss.item()
 
-                running_loss_1 += loss_1.item()
-                running_loss_2 += loss_2.item()
-        
-    avg_loss_1 = running_loss_1 / len(loader1)
-    avg_loss_2 = running_loss_2 / len(loader2)
+    return running_loss / len(loader)
 
-    return avg_loss_1, avg_loss_2
 
 
 if __name__ == "__main__":
@@ -155,45 +169,63 @@ if __name__ == "__main__":
                 ])
         }
 
-    train_loader1, val_loader1 = CatsVsDogs_Dataset(tranformations)
+    # Get dataset 1
+    train_loader1, val_loader1 = catsVsDogs_Dataset(tranformations)
+
+    # get dataset 2 csv_path, root_dir, split, transform=None
+    csv_path = '/scratch/gssodhi/butterfly/splits.csv'
+    root_dir = '/scratch/gssodhi/butterfly'
+
+    train_dataset_2 = ButterFly(csv_path, root_dir, split='train', transform=tranformations['train'])
+    val_dataset_2 = ButterFly(csv_path, root_dir, split='valid', transform=tranformations['val'])
+
+    train_loader_2 = DataLoader(
+        train_dataset_2,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers
+    )
+
+    val_loader_2 = DataLoader(
+        val_dataset_2,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers
+    )
+
 
     # load model
     myModel = ResNet_MTL(
-                        num_classes_1 = 1, 
-                        num_class_2 = 4
+                        num_class_1 = 1, 
+                        num_class_2 = 100
                     )
 
     myModel.to(device)
 
-    criterion1 = nn.BCEWithLogitLoss()
-    criterion1 = nn.CrossEntropyLoss()
+    criterion1 = nn.BCEWithLogitsLoss()
+    criterion2 = nn.CrossEntropyLoss()
 
-    optimizer = Adam(model.parameters, lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = Adam(myModel.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     train_loss_1, val_loss_1 = [], []
     train_loss_2, val_loss_2 = [], []
-    for epoch in config.epochs:
+    for epoch in range(config.epochs):
+        # Task 1: Cats vs Dogs
+        train_loss_1 = train(
+            myModel, train_loader1, criterion1, optimizer, device, task='bce'
+        )
+        val_loss_1 = test(
+            myModel, val_loader1, criterion1, device, task='bce'
+        )
 
-        train_loss_1, train_loss_2 = train(myModel, 
-                                        train_loader1,
-                                        train_loader1,
-                                        criterion1,
-                                        criterion2,
-                                        optimizer,
-                                        device)
+        # Task 2: Butterflies
+        train_loss_2 = train(
+            myModel, train_loader_2, criterion2, optimizer, device, task='ce'
+        )
+        val_loss_2 = test(
+            myModel, val_loader_2, criterion2, device, task='ce'
+        )
 
-        val_loss_1, val_loss_2 = test(myModel, 
-                                        val_loader1,
-                                        val_loader1,
-                                        criterion1,
-                                        criterion2,
-                                        device)
-
-        print(f"Epoch {epoch+1}/{args.epochs} | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {test_loss:.4f} | Val Acc: {test_acc:.4f} | "
-            f"F1: {f1:.4f} | AUC: {auc:.4f}")
-
-
-
-
+        print(f"Epoch {epoch}: "
+            f"BCE train {train_loss_1:.4f} val {val_loss_1:.4f} | "
+            f"CE train {train_loss_2:.4f} val {val_loss_2:.4f}")
